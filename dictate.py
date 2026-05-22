@@ -36,14 +36,21 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 
 # Whisper Model Configuration
+# Note: For significantly higher accuracy, you can change this to "small.en" or "small" (multilingual).
+# If the Intel CPU handles it fine, you can even try "medium.en".
 MODEL_SIZE = "base.en"
 DEVICE = "cpu"
 COMPUTE_TYPE = "float32"
 CPU_THREADS = 6
 
+# Initial prompt to guide Whisper on spelling, context, and proper nouns (e.g. "Muhammad", "Sargodha")
+# This is a powerful way to guide Whisper's spelling of names and format dictation.
+INITIAL_PROMPT = "Hello, my name is Muhammad. I am from Sargodha. I am dictating clear English speech."
+
 # VAD Settings
 AUTO_COMMIT_DELAY = 0.8  # Commit audio segment after 0.8 seconds of silence
 STREAMING_INTERVAL = 1.0  # Transcribe provisional text every 1.0s of continuous speech
+VAD_SENSITIVITY_MULTIPLIER = 1.8  # Calibration noise floor multiplier (Default: 1.8, range 1.5 - 2.5)
 
 # State Machine States
 STATE_IDLE = "IDLE"
@@ -101,6 +108,7 @@ def audio_processing_worker():
     """
     global latest_transcription
     speech_buffer = []
+    pre_speech_buffer = []
     has_speech = False
     silence_duration = 0.0
     last_stream_time = 0.0
@@ -129,6 +137,7 @@ def audio_processing_worker():
                     speech_buffer = []
                 has_speech = False
                 silence_duration = 0.0
+                pre_speech_buffer.clear()
                 raw_audio_queue.task_done()
                 continue
                 
@@ -137,12 +146,13 @@ def audio_processing_worker():
             chunk_duration = len(chunk) / SAMPLE_RATE
             
             if rms > VAD_THRESHOLD:
-                speech_buffer.append(chunk)
-                silence_duration = 0.0
-                
                 # Speech starts
                 if not has_speech:
                     has_speech = True
+                    # Prepend pre-speech buffer to catch the onset of the word
+                    speech_buffer = list(pre_speech_buffer)
+                    pre_speech_buffer.clear()
+                    
                     last_stream_time = time.time()
                     
                     # Smart Newline: Prepend a newline if the pause was 3.0s or more
@@ -150,13 +160,16 @@ def audio_processing_worker():
                         should_prepend_newline = True
                     else:
                         should_prepend_newline = False
-                else:
-                    # Periodically stream the accumulated buffer to Whisper for real-time feedback
-                    current_time = time.time()
-                    if current_time - last_stream_time >= STREAMING_INTERVAL:
-                        audio_data = np.concatenate(speech_buffer, axis=0).flatten()
-                        push_streaming_audio(audio_data, should_prepend_newline)
-                        last_stream_time = current_time
+                
+                speech_buffer.append(chunk)
+                silence_duration = 0.0
+                
+                # Periodically stream the accumulated buffer to Whisper for real-time feedback
+                current_time = time.time()
+                if current_time - last_stream_time >= STREAMING_INTERVAL:
+                    audio_data = np.concatenate(speech_buffer, axis=0).flatten()
+                    push_streaming_audio(audio_data, should_prepend_newline)
+                    last_stream_time = current_time
             else:
                 if has_speech:
                     speech_buffer.append(chunk)
@@ -173,9 +186,13 @@ def audio_processing_worker():
                         speech_buffer = []
                         has_speech = False
                         silence_duration = 0.0
+                        pre_speech_buffer.clear()
                 else:
-                    # Discard quiet chunks during long silence
-                    pass
+                    # Discard quiet chunks during long silence but keep them in pre_speech_buffer
+                    pre_speech_buffer.append(chunk)
+                    # Limit pre-speech buffer to last ~320ms (5 chunks * 64ms)
+                    if len(pre_speech_buffer) > 5:
+                        pre_speech_buffer.pop(0)
             
             # Throttle visual real-time status bar updates to ~10Hz or state changes
             current_time = time.time()
@@ -248,6 +265,7 @@ def transcription_worker(model):
                 beam_size=5,
                 language="en",
                 vad_filter=True,
+                initial_prompt=INITIAL_PROMPT,
             )
             text_segments = [seg.text for seg in segments]
             full_text = "".join(text_segments).strip()
@@ -364,7 +382,7 @@ def main():
         calib_data = sd.rec(int(0.8 * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=CHANNELS, dtype='float32')
         sd.wait()
         calib_rms = np.sqrt(np.mean(calib_data**2))
-        VAD_THRESHOLD = max(calib_rms * 2.2, 0.0025)
+        VAD_THRESHOLD = max(calib_rms * VAD_SENSITIVITY_MULTIPLIER, 0.0025)
         print(f"✅ {GREEN}Calibration complete!{RESET} Noise RMS: {calib_rms:.5f} | Threshold set to: {VAD_THRESHOLD:.5f}")
     except Exception as e:
         VAD_THRESHOLD = 0.003
