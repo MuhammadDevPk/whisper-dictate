@@ -1,0 +1,13 @@
+# Python bytecode cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local virtual environment
+.venv/
+venv/
+ENV/
+
+# OS-specific files
+.DS_Store
