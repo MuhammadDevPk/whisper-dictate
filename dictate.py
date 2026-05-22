@@ -1,449 +1,531 @@
 #!/usr/bin/env python3
 """
-dictate.py - On-Demand Continuous Voice-to-Text Dictation Utility
+dictate.py — Blazing-Fast On-Demand Voice-to-Text Dictation
 
-Requirements:
-1. Persistent accelerated base.en Whisper model loaded strictly on CPU (6 threads, float32).
-2. Global Keyboard Hook (Option + S or Cmd + Shift + S) or Enter to toggle continuous dictation.
-3. Sound capture buffer via sounddevice InputStream at 16kHz, mono channel.
-4. Voice Activity Detection (VAD) using startup microphone noise calibration.
-5. Real-time streaming transcription running every 1.0s with diff-based typing and backspace correction.
-6. Smart Newline logic: appends text on same line unless user pauses for >= 3.0 seconds.
-7. Clean terminal status line to prevent scrolling clutter.
+A production-grade, real-time dictation utility optimized for macOS on Intel x86_64.
+Keeps a Whisper model persistently in RAM for instant inference.
+Uses adaptive VAD with pre-speech buffering for accurate word-onset detection.
+Streams provisional transcription with diff-based typing for seamless real-time output.
+
+Usage:
+    .venv/bin/python dictate.py
+
+    Press Option+S or Cmd+Shift+S (or Enter in terminal) to toggle dictation.
+    Click into any text field before speaking — text is typed at the active cursor.
 """
+
+from __future__ import annotations
 
 import sys
 import time
 import queue
 import threading
 import traceback
+from collections import deque
+
 import numpy as np
 import sounddevice as sd
 from pynput import keyboard
 from faster_whisper import WhisperModel
 
-# Terminal colors for clean logging
-GREEN = "\033[92m"
-RED = "\033[91m"
-YELLOW = "\033[93m"
-BLUE = "\033[94m"
-CYAN = "\033[96m"
-BOLD = "\033[1m"
-RESET = "\033[0m"
 
-# Audio Settings
-SAMPLE_RATE = 16000
-CHANNELS = 1
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURATION — Tune these for your hardware and preferences
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# Whisper Model Configuration
-# Note: For significantly higher accuracy, you can change this to "small.en" or "small" (multilingual).
-# If the Intel CPU handles it fine, you can even try "medium.en".
-MODEL_SIZE = "base.en"
-DEVICE = "cpu"
-COMPUTE_TYPE = "float32"
-CPU_THREADS = 6
+# ── Audio Capture ─────────────────────────────────────────────────────────────
+SAMPLE_RATE: int = 16_000       # Hz — Whisper expects 16 kHz
+CHANNELS: int = 1               # Mono
+BLOCKSIZE: int = 1024           # Samples per chunk (64 ms at 16 kHz)
 
-# Initial prompt to guide Whisper on spelling, context, and proper nouns (e.g. "Muhammad", "Sargodha")
-# This is a powerful way to guide Whisper's spelling of names and format dictation.
-INITIAL_PROMPT = "Hello, my name is Muhammad. I am from Sargodha. I am dictating clear English speech."
+# ── Whisper Model ─────────────────────────────────────────────────────────────
+# Model accuracy / speed ladder (English-only):
+#   "tiny.en"   → Fastest,  lowest accuracy  (~39 MB)
+#   "base.en"   → Fast,     decent accuracy   (~74 MB)
+#   "small.en"  → Balanced, good accuracy     (~461 MB)  ← RECOMMENDED
+#   "medium.en" → Slower,   high accuracy     (~1.5 GB)
+MODEL_SIZE: str = "small.en"
+DEVICE: str = "cpu"
+COMPUTE_TYPE: str = "int8"      # int8 is 2-3× faster than float32 on Intel x86_64
+CPU_THREADS: int = 6
 
-# VAD Settings
-AUTO_COMMIT_DELAY = 0.8  # Commit audio segment after 0.8 seconds of silence
-STREAMING_INTERVAL = 1.0  # Transcribe provisional text every 1.0s of continuous speech
-VAD_SENSITIVITY_MULTIPLIER = 1.8  # Calibration noise floor multiplier (Default: 1.8, range 1.5 - 2.5)
+# ── Inference Tuning ──────────────────────────────────────────────────────────
+BEAM_SIZE_STREAMING: int = 1    # Greedy decoding for streaming previews (fastest)
+BEAM_SIZE_FINAL: int = 5        # Beam search for final commits (most accurate)
 
-# State Machine States
-STATE_IDLE = "IDLE"
-STATE_RECORDING = "RECORDING"
-STATE_TRANSCRIBING = "TRANSCRIBING"
+# Prime Whisper with correct spellings of names / terms you use often.
+# This dramatically improves recognition of proper nouns.
+INITIAL_PROMPT: str = (
+    "Hello, my name is Muhammad. I am from Sargodha. "
+    "I am dictating clear, well-punctuated English text."
+)
 
-# Global state variables
-current_state = STATE_IDLE
-state_lock = threading.Lock()
-
-raw_audio_queue = queue.Queue()
-transcription_queue = queue.Queue()
-audio_stream = None
-
-# Calibrated Threshold (will be configured at startup)
-VAD_THRESHOLD = 0.003
-latest_transcription = ""
-
-# pynput Keyboard Controller
-keyboard_controller = keyboard.Controller()
+# ── Voice Activity Detection ─────────────────────────────────────────────────
+VAD_SENSITIVITY: float = 1.8    # Noise-floor multiplier (lower = more sensitive; 1.3–2.5)
+AUTO_COMMIT_DELAY: float = 0.5  # Seconds of silence before finalizing a segment
+STREAMING_INTERVAL: float = 0.4 # Seconds between streaming transcription updates
+PRE_SPEECH_CHUNKS: int = 5      # Chunks retained before speech onset (~320 ms cushion)
+NEWLINE_PAUSE: float = 3.0      # Seconds of pause before inserting a newline
 
 
-def audio_callback(indata, frames, time_info, status):
-    """Callback function for sounddevice to capture audio chunks."""
+# ═══════════════════════════════════════════════════════════════════════════════
+#  INTERNAL CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Terminal ANSI colours
+_G = "\033[92m"     # green
+_R = "\033[91m"     # red
+_Y = "\033[93m"     # yellow
+_B = "\033[94m"     # blue
+_C = "\033[96m"     # cyan
+_BD = "\033[1m"     # bold
+_RS = "\033[0m"     # reset
+
+# Sentinel objects for the raw-audio queue
+_FLUSH = object()   # flush remaining speech buffer and commit
+_STOP = object()    # shut down the processing worker
+
+# State machine
+_S_IDLE = "IDLE"
+_S_REC = "RECORDING"
+_S_XSCR = "TRANSCRIBING"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GLOBAL STATE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_state: str = _S_IDLE
+_state_lock = threading.Lock()
+
+_raw_q: queue.Queue = queue.Queue()
+_xscr_q: queue.Queue = queue.Queue()
+_stream: sd.InputStream | None = None
+
+_vad_threshold: float = 0.003
+_latest_text: str = ""
+
+_kb = keyboard.Controller()
+
+# Duration of one audio chunk in seconds (computed once)
+_CHUNK_SEC: float = BLOCKSIZE / SAMPLE_RATE
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AUDIO PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _audio_cb(indata: np.ndarray, frames: int, time_info, status) -> None:
+    """PortAudio callback — pushes raw audio chunks to the processing queue."""
     if status:
-        print(f"\n{YELLOW}⚠️  Audio stream warning: {status}{RESET}", file=sys.stderr)
-    raw_audio_queue.put((indata.copy(), False))
+        print(f"\n{_Y}⚠️  Audio: {status}{_RS}", file=sys.stderr)
+    _raw_q.put(indata.copy())
 
 
-def push_streaming_audio(audio_data, prepend_newline):
+def _enqueue_streaming(audio: np.ndarray, prepend_nl: bool) -> None:
     """
-    Clears any old/stale streaming chunks from the transcription queue
-    to prevent queue lag, keeping final commits and shutdown commands intact.
+    Queue a streaming (provisional) transcription request.
+    Drops stale streaming items to prevent backlog while preserving
+    final commits and shutdown signals.
     """
-    temp = []
-    while not transcription_queue.empty():
+    kept: list = []
+    while not _xscr_q.empty():
         try:
-            item = transcription_queue.get_nowait()
-            if item is None or item[1]:  # Keep shutdown signal (None) or final commits (True)
-                temp.append(item)
+            item = _xscr_q.get_nowait()
+            if item is None or item[1]:     # shutdown signal or is_final
+                kept.append(item)
         except queue.Empty:
             break
-            
-    for item in temp:
-        transcription_queue.put(item)
-        
-    transcription_queue.put((audio_data, False, prepend_newline))
+    for item in kept:
+        _xscr_q.put(item)
+    _xscr_q.put((audio, False, prepend_nl))
 
 
-def audio_processing_worker():
+def _vad_worker() -> None:
     """
-    Dedicated worker thread that processes raw audio chunks from raw_audio_queue.
-    Performs calibrated threshold VAD filtering and groups active speech frames.
-    Commits completed segments and updates provisional streaming chunks.
+    VAD worker thread.
+
+    Reads raw audio chunks, detects speech using calibrated RMS thresholds,
+    maintains a pre-speech ring buffer for clean word onsets, and dispatches
+    audio segments for transcription.
     """
-    global latest_transcription
-    speech_buffer = []
-    pre_speech_buffer = []
-    has_speech = False
-    silence_duration = 0.0
-    last_stream_time = 0.0
-    last_commit_time = 0.0
-    should_prepend_newline = False
-    
-    last_print_time = 0.0
-    last_has_speech = False
-    
+    global _latest_text
+
+    speech_buf: list[np.ndarray] = []
+    pre_speech: deque[np.ndarray] = deque(maxlen=PRE_SPEECH_CHUNKS)
+    is_speaking = False
+    silence_s = 0.0
+    last_stream_t = 0.0
+    last_commit_t = 0.0
+    prepend_nl = False
+
+    # Throttle terminal redraws to ≤ 10 Hz
+    last_print_t = 0.0
+    prev_speaking = False
+
     while True:
         try:
-            item = raw_audio_queue.get()
-            if item is None:
-                raw_audio_queue.task_done()
+            chunk = _raw_q.get()
+
+            # ── Shutdown ──
+            if chunk is _STOP:
+                _raw_q.task_done()
                 break
-                
-            chunk, is_flush = item
-            
-            # 1. Handle Flush Signal (recording stopped)
-            if is_flush:
-                if speech_buffer:
-                    audio_data = np.concatenate(speech_buffer, axis=0).flatten()
-                    rms = np.sqrt(np.mean(audio_data**2))
-                    if rms >= 0.0001:
-                        transcription_queue.put((audio_data, True, should_prepend_newline))
-                    speech_buffer = []
-                has_speech = False
-                silence_duration = 0.0
-                pre_speech_buffer.clear()
-                raw_audio_queue.task_done()
+
+            # ── Flush (recording stopped) ──
+            if chunk is _FLUSH:
+                if speech_buf:
+                    audio = np.concatenate(speech_buf).flatten()
+                    if np.sqrt(np.mean(audio ** 2)) >= 1e-4:
+                        _xscr_q.put((audio, True, prepend_nl))
+                    speech_buf.clear()
+                is_speaking = False
+                silence_s = 0.0
+                pre_speech.clear()
+                _raw_q.task_done()
                 continue
-                
-            # 2. Process Standard Audio Chunk
-            rms = np.sqrt(np.mean(chunk**2))
-            chunk_duration = len(chunk) / SAMPLE_RATE
-            
-            if rms > VAD_THRESHOLD:
-                # Speech starts
-                if not has_speech:
-                    has_speech = True
-                    # Prepend pre-speech buffer to catch the onset of the word
-                    speech_buffer = list(pre_speech_buffer)
-                    pre_speech_buffer.clear()
-                    
-                    last_stream_time = time.time()
-                    
-                    # Smart Newline: Prepend a newline if the pause was 3.0s or more
-                    if last_commit_time > 0.0 and (time.time() - last_commit_time >= 3.0):
-                        should_prepend_newline = True
-                    else:
-                        should_prepend_newline = False
-                
-                speech_buffer.append(chunk)
-                silence_duration = 0.0
-                
-                # Periodically stream the accumulated buffer to Whisper for real-time feedback
-                current_time = time.time()
-                if current_time - last_stream_time >= STREAMING_INTERVAL:
-                    audio_data = np.concatenate(speech_buffer, axis=0).flatten()
-                    push_streaming_audio(audio_data, should_prepend_newline)
-                    last_stream_time = current_time
+
+            # ── Normal audio chunk ──
+            rms = np.sqrt(np.mean(chunk ** 2))
+
+            if rms > _vad_threshold:
+                # Speech detected
+                if not is_speaking:
+                    is_speaking = True
+                    speech_buf = list(pre_speech)   # prepend onset cushion
+                    pre_speech.clear()
+                    last_stream_t = time.monotonic()
+                    prepend_nl = (
+                        last_commit_t > 0
+                        and time.monotonic() - last_commit_t >= NEWLINE_PAUSE
+                    )
+
+                speech_buf.append(chunk)
+                silence_s = 0.0
+
+                # Periodic streaming transcription
+                now = time.monotonic()
+                if now - last_stream_t >= STREAMING_INTERVAL:
+                    _enqueue_streaming(
+                        np.concatenate(speech_buf).flatten(), prepend_nl,
+                    )
+                    last_stream_t = now
             else:
-                if has_speech:
-                    speech_buffer.append(chunk)
-                    silence_duration += chunk_duration
-                    
-                    # If silence duration exceeds the commit delay, finalize the segment
-                    if silence_duration >= AUTO_COMMIT_DELAY:
-                        audio_data = np.concatenate(speech_buffer, axis=0).flatten()
-                        transcription_queue.put((audio_data, True, should_prepend_newline))
-                        
-                        last_commit_time = time.time()
-                        
-                        # Reset for next speech segment
-                        speech_buffer = []
-                        has_speech = False
-                        silence_duration = 0.0
-                        pre_speech_buffer.clear()
+                # Silence
+                if is_speaking:
+                    speech_buf.append(chunk)
+                    silence_s += _CHUNK_SEC
+                    if silence_s >= AUTO_COMMIT_DELAY:
+                        _xscr_q.put((
+                            np.concatenate(speech_buf).flatten(),
+                            True,
+                            prepend_nl,
+                        ))
+                        last_commit_t = time.monotonic()
+                        speech_buf.clear()
+                        is_speaking = False
+                        silence_s = 0.0
+                        pre_speech.clear()
                 else:
-                    # Discard quiet chunks during long silence but keep them in pre_speech_buffer
-                    pre_speech_buffer.append(chunk)
-                    # Limit pre-speech buffer to last ~320ms (5 chunks * 64ms)
-                    if len(pre_speech_buffer) > 5:
-                        pre_speech_buffer.pop(0)
-            
-            # Throttle visual real-time status bar updates to ~10Hz or state changes
-            current_time = time.time()
-            if (current_time - last_print_time >= 0.1) or (has_speech != last_has_speech):
-                buf_duration_sec = len(speech_buffer) * chunk_duration
-                status_text = f"{GREEN}🟢{RESET}" if has_speech else f"{YELLOW}⚪{RESET}"
-                display_text = latest_transcription
-                if len(display_text) > 20:
-                    display_text = "..." + display_text[-17:]
-                
-                # Ultra-compact single-line overwrite that fits in standard 80-column terminal
-                print(f"\rVAD: {status_text} | RMS: {rms:.4f}/{VAD_THRESHOLD:.4f} | Buf: {buf_duration_sec:.1f}s | \"{CYAN}{display_text}{RESET}\"    ", end="", flush=True)
-                last_print_time = current_time
-                last_has_speech = has_speech
-            
-            raw_audio_queue.task_done()
-            
-        except Exception as e:
-            print(f"\n{RED}❌ Error in audio processing thread: {e}{RESET}", file=sys.stderr)
+                    pre_speech.append(chunk)     # deque auto-evicts oldest
+
+            # ── Status bar (throttled) ──
+            now = time.monotonic()
+            if (now - last_print_t >= 0.1) or (is_speaking != prev_speaking):
+                buf_s = len(speech_buf) * _CHUNK_SEC
+                icon = f"{_G}🟢{_RS}" if is_speaking else f"{_Y}⚪{_RS}"
+                txt = _latest_text
+                if len(txt) > 20:
+                    txt = "…" + txt[-19:]
+                print(
+                    f"\rVAD: {icon} | RMS: {rms:.4f}/{_vad_threshold:.4f}"
+                    f" | Buf: {buf_s:.1f}s | \"{_C}{txt}{_RS}\"    ",
+                    end="", flush=True,
+                )
+                last_print_t = now
+                prev_speaking = is_speaking
+
+            _raw_q.task_done()
+
+        except Exception as exc:
+            print(f"\n{_R}❌ VAD error: {exc}{_RS}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
 
 
-def update_typing(old_text, new_text):
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TYPING ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _diff_type(old: str, new: str) -> None:
     """
-    Dynamically typing diffs: compares old_text and new_text,
-    sends Backspaces for modified letters, and types new letters.
+    Minimal-edit typing: finds the longest common prefix between *old* and
+    *new*, backspaces the divergent suffix of *old*, then types the new suffix.
     """
-    common_len = 0
-    min_len = min(len(old_text), len(new_text))
-    for i in range(min_len):
-        if old_text[i] == new_text[i]:
-            common_len += 1
-        else:
+    if old == new:
+        return
+
+    # Common prefix length
+    pfx = 0
+    for a, b in zip(old, new):
+        if a != b:
             break
-            
-    backspaces = len(old_text) - common_len
-    suffix_to_type = new_text[common_len:]
-    
-    # 1. Backspace deleted letters
-    if backspaces > 0:
-        for _ in range(backspaces):
-            keyboard_controller.press(keyboard.Key.backspace)
-            keyboard_controller.release(keyboard.Key.backspace)
-            time.sleep(0.005)  # 5ms delay to prevent OS dropouts
-            
-    # 2. Type new letters
-    if suffix_to_type:
-        keyboard_controller.type(suffix_to_type)
+        pfx += 1
+
+    # Backspace removed characters
+    to_del = len(old) - pfx
+    if to_del:
+        for _ in range(to_del):
+            _kb.press(keyboard.Key.backspace)
+            _kb.release(keyboard.Key.backspace)
+            time.sleep(0.003)           # 3 ms — prevents macOS event coalescing
+
+    # Type new characters
+    to_type = new[pfx:]
+    if to_type:
+        _kb.type(to_type)
 
 
-def transcription_worker(model):
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TRANSCRIPTION WORKER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _xscr_worker(model: WhisperModel) -> None:
     """
-    Background worker thread that transcribes committed and streaming segments,
-    and updates the active typing buffer.
+    Background thread that runs Whisper inference on queued audio segments.
+
+    Uses **greedy decoding** for streaming previews (lowest latency) and
+    **beam search** for final commits (highest accuracy).
     """
-    global current_state, latest_transcription
-    typed_text = ""
-    
+    global _state, _latest_text
+
+    typed = ""
+
     while True:
-        item = transcription_queue.get()
+        item = _xscr_q.get()
         if item is None:
-            transcription_queue.task_done()
+            _xscr_q.task_done()
             break
-            
-        audio_data, is_final, prepend_newline = item
-        
+
+        audio_data, is_final, do_newline = item
+
         try:
-            segments, info = model.transcribe(
+            beam = BEAM_SIZE_FINAL if is_final else BEAM_SIZE_STREAMING
+            segments, _ = model.transcribe(
                 audio_data,
-                beam_size=5,
+                beam_size=beam,
                 language="en",
-                vad_filter=True,
                 initial_prompt=INITIAL_PROMPT,
+                without_timestamps=True,
             )
-            text_segments = [seg.text for seg in segments]
-            full_text = "".join(text_segments).strip()
-            
-            if full_text:
-                # Prepend a newline exactly once at start of segment if user paused for >= 3s
-                if prepend_newline and not typed_text:
-                    keyboard_controller.type("\n")
-                
-                # Perform the differential typing
-                update_typing(typed_text, full_text)
-                
+            full = "".join(seg.text for seg in segments).strip()
+
+            if full:
+                if do_newline and not typed:
+                    _kb.type("\n")
+
+                _diff_type(typed, full)
+
                 if is_final:
-                    # Append a trailing space for next segment and clear state
-                    keyboard_controller.type(" ")
-                    typed_text = ""
-                    latest_transcription = ""
-                    # Print completed line cleanly in terminal
-                    print(f"\n✨ {GREEN}{BOLD}[Committed]{RESET} \"{full_text}\"")
+                    _kb.type(" ")
+                    typed = ""
+                    _latest_text = ""
+                    print(f"\n✨ {_G}{_BD}[Committed]{_RS} \"{full}\"")
                 else:
-                    latest_transcription = full_text
-                    typed_text = full_text
-            else:
-                if is_final:
-                    # If empty final text, make sure we clear any provisional typing
-                    update_typing(typed_text, "")
-                    typed_text = ""
-                    latest_transcription = ""
-                    
-        except Exception as e:
-            print(f"\n{RED}❌ Error in transcription worker: {e}{RESET}", file=sys.stderr)
+                    typed = full
+                    _latest_text = full
+            elif is_final:
+                # Empty final — clear any provisional typing
+                _diff_type(typed, "")
+                typed = ""
+                _latest_text = ""
+
+        except Exception as exc:
+            print(f"\n{_R}❌ Transcription error: {exc}{_RS}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
         finally:
-            transcription_queue.task_done()
-            
-            # Check if we should transition back to IDLE
-            with state_lock:
-                if current_state == STATE_TRANSCRIBING and transcription_queue.empty() and audio_stream is None:
-                    current_state = STATE_IDLE
-                    print(f"\n[Ready] Sitting in background (Press {CYAN}Option+S{RESET}, {CYAN}Cmd+Shift+S{RESET}, or {CYAN}Enter{RESET} to toggle)...")
+            _xscr_q.task_done()
+            with _state_lock:
+                if (
+                    _state == _S_XSCR
+                    and _xscr_q.empty()
+                    and _stream is None
+                ):
+                    _state = _S_IDLE
+                    print(
+                        f"\n{_G}[Ready]{_RS} Press {_C}Option+S{_RS}, "
+                        f"{_C}Cmd+Shift+S{_RS}, or {_C}Enter{_RS} to toggle…"
+                    )
 
 
-def toggle_recording():
-    """Toggles state between IDLE and RECORDING, spawning worker tasks as appropriate."""
-    global current_state, audio_stream
-    
-    with state_lock:
-        if current_state == STATE_IDLE:
-            # Transition IDLE -> RECORDING
-            while not raw_audio_queue.empty():
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RECORDING CONTROL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _toggle() -> None:
+    """Thread-safe state machine: IDLE → RECORDING → TRANSCRIBING."""
+    global _state, _stream
+
+    with _state_lock:
+        if _state == _S_IDLE:
+            # Drain stale audio
+            while not _raw_q.empty():
                 try:
-                    raw_audio_queue.get_nowait()
+                    _raw_q.get_nowait()
                 except queue.Empty:
                     break
-            
+
             try:
-                audio_stream = sd.InputStream(
+                _stream = sd.InputStream(
                     samplerate=SAMPLE_RATE,
                     channels=CHANNELS,
                     dtype="float32",
-                    blocksize=1024,
-                    callback=audio_callback
+                    blocksize=BLOCKSIZE,
+                    callback=_audio_cb,
                 )
-                audio_stream.start()
-                current_state = STATE_RECORDING
-                print(f"\n🟢 {GREEN}{BOLD}Listening...{RESET} (Continuous dictation active. Press Option+S, Cmd+Shift+S, or Enter in terminal to stop)")
-            except Exception as e:
-                print(f"\n{RED}❌ Failed to start recording: {e}{RESET}", file=sys.stderr)
-                print(f"{YELLOW}💡 Tip: Ensure terminal has Microphone Access in macOS System Settings -> Privacy & Security -> Microphone.{RESET}", file=sys.stderr)
-                
-        elif current_state == STATE_RECORDING:
-            # Transition RECORDING -> TRANSCRIBING
-            current_state = STATE_TRANSCRIBING
-            print(f"\n⏹️  {BLUE}Stopping continuous dictation...{RESET}")
-            
-            # Stop the audio stream immediately
-            if audio_stream:
+                _stream.start()
+                _state = _S_REC
+                print(
+                    f"\n🟢 {_G}{_BD}Listening…{_RS}"
+                    f" (Press hotkey or Enter to stop)"
+                )
+            except Exception as exc:
+                print(f"\n{_R}❌ Mic error: {exc}{_RS}", file=sys.stderr)
+                print(
+                    f"{_Y}💡 Grant Microphone access in "
+                    f"System Settings → Privacy & Security → Microphone{_RS}",
+                    file=sys.stderr,
+                )
+
+        elif _state == _S_REC:
+            _state = _S_XSCR
+            print(f"\n⏹️  {_B}Stopping…{_RS}")
+            if _stream:
                 try:
-                    audio_stream.stop()
-                    audio_stream.close()
-                except Exception as e:
-                    print(f"{RED}❌ Error stopping audio stream: {e}{RESET}", file=sys.stderr)
-                audio_stream = None
-                
-            # Signal the processing worker to flush whatever is remaining in its buffer
-            raw_audio_queue.put((None, True))
-            
-        elif current_state == STATE_TRANSCRIBING:
-            print(f"\n{YELLOW}⚠️  Transcribing/Typing in progress. Please wait...{RESET}", end="", flush=True)
+                    _stream.stop()
+                    _stream.close()
+                except Exception as exc:
+                    print(f"{_R}❌ Stream error: {exc}{_RS}", file=sys.stderr)
+                _stream = None
+            _raw_q.put(_FLUSH)
+
+        elif _state == _S_XSCR:
+            print(
+                f"\n{_Y}⏳ Finalizing, please wait…{_RS}",
+                end="", flush=True,
+            )
 
 
-def on_hotkey_pressed():
-    """Wrapper called when a toggle trigger is fired."""
-    threading.Thread(target=toggle_recording, daemon=True).start()
+def _on_hotkey() -> None:
+    """Hotkey callback — dispatches toggle to a daemon thread."""
+    threading.Thread(target=_toggle, daemon=True).start()
 
 
-def main():
-    global VAD_THRESHOLD
-    print(f"{BLUE}{BOLD}=== Whisper On-Demand Dictation Utility ==={RESET}")
-    
-    # 1. Query audio input device
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    global _vad_threshold
+
+    print(f"\n{_B}{_BD}═══ Whisper Dictation ═══{_RS}")
+    print(
+        f"{_C}Model: {MODEL_SIZE} | Compute: {COMPUTE_TYPE} | "
+        f"Threads: {CPU_THREADS}{_RS}\n"
+    )
+
+    # ── Audio device ──────────────────────────────────────────────────────────
     try:
-        input_device = sd.query_devices(kind="input")
-        device_name = input_device.get("name", "Default Device")
-        print(f"🎤 Default Input Device: {CYAN}{device_name}{RESET}")
-    except Exception as e:
-        print(f"{RED}❌ No input audio devices found or sounddevice error: {e}{RESET}", file=sys.stderr)
+        dev = sd.query_devices(kind="input")
+        print(f"🎤 Input: {_C}{dev.get('name', 'Default')}{_RS}")
+    except Exception as exc:
+        print(f"{_R}❌ No audio input: {exc}{_RS}", file=sys.stderr)
         sys.exit(1)
 
-    # 2. Calibrate background noise level
-    print(f"🎙️  {CYAN}Calibrating microphone noise floor... Please remain silent for 1 second.{RESET}")
+    # ── Noise calibration ─────────────────────────────────────────────────────
+    print("🎙️  Calibrating noise floor (stay silent)…")
     try:
-        # Record a small silent chunk to compute noise floor
-        calib_data = sd.rec(int(0.8 * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=CHANNELS, dtype='float32')
+        calib = sd.rec(
+            int(0.8 * SAMPLE_RATE),
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype="float32",
+        )
         sd.wait()
-        calib_rms = np.sqrt(np.mean(calib_data**2))
-        VAD_THRESHOLD = max(calib_rms * VAD_SENSITIVITY_MULTIPLIER, 0.0025)
-        print(f"✅ {GREEN}Calibration complete!{RESET} Noise RMS: {calib_rms:.5f} | Threshold set to: {VAD_THRESHOLD:.5f}")
-    except Exception as e:
-        VAD_THRESHOLD = 0.003
-        print(f"{YELLOW}⚠️  Calibration failed ({e}). Using default threshold: {VAD_THRESHOLD}{RESET}")
+        noise_rms = float(np.sqrt(np.mean(calib ** 2)))
+        _vad_threshold = max(noise_rms * VAD_SENSITIVITY, 0.0025)
+        print(f"✅ Noise: {noise_rms:.5f} → Threshold: {_vad_threshold:.5f}")
+    except Exception as exc:
+        _vad_threshold = 0.003
+        print(f"{_Y}⚠️  Calibration failed: {exc} (using {_vad_threshold}){_RS}")
 
-    # 3. Load model
-    print(f"🧠 Loading Whisper model '{CYAN}{MODEL_SIZE}{RESET}' on CPU (Threads: {CPU_THREADS}, Compute: {COMPUTE_TYPE})...")
-    
+    # ── Load model ────────────────────────────────────────────────────────────
+    print(f"🧠 Loading {_C}{MODEL_SIZE}{_RS} ({COMPUTE_TYPE})…")
+    model: WhisperModel | None = None
     try:
         model = WhisperModel(
             MODEL_SIZE,
             device=DEVICE,
             compute_type=COMPUTE_TYPE,
-            cpu_threads=CPU_THREADS
+            cpu_threads=CPU_THREADS,
         )
-        print(f"✅ Model loaded into RAM successfully!")
-    except Exception as e:
-        print(f"{RED}❌ Failed to load Whisper model: {e}{RESET}", file=sys.stderr)
-        sys.exit(1)
+        print(f"✅ Model loaded and cached in RAM")
+    except Exception as exc:
+        if COMPUTE_TYPE != "float32":
+            print(
+                f"{_Y}⚠️  {COMPUTE_TYPE} failed ({exc}), "
+                f"falling back to float32…{_RS}"
+            )
+            try:
+                model = WhisperModel(
+                    MODEL_SIZE,
+                    device=DEVICE,
+                    compute_type="float32",
+                    cpu_threads=CPU_THREADS,
+                )
+                print(f"✅ Model loaded (float32 fallback)")
+            except Exception as exc2:
+                print(
+                    f"{_R}❌ Model load failed: {exc2}{_RS}", file=sys.stderr
+                )
+                sys.exit(1)
+        else:
+            print(f"{_R}❌ Model load failed: {exc}{_RS}", file=sys.stderr)
+            sys.exit(1)
 
-    # 4. Start background worker threads
-    processing_thread = threading.Thread(target=audio_processing_worker, daemon=True)
-    processing_thread.start()
+    assert model is not None
 
-    transcription_thread = threading.Thread(target=transcription_worker, args=(model,), daemon=True)
-    transcription_thread.start()
+    # ── Start workers ─────────────────────────────────────────────────────────
+    threading.Thread(target=_vad_worker, daemon=True).start()
+    threading.Thread(target=_xscr_worker, args=(model,), daemon=True).start()
 
-    # 5. Set up Global Keyboard Hotkeys
-    hotkeys_dict = {
-        "<alt>+s": on_hotkey_pressed,
-        "<cmd>+<shift>+s": on_hotkey_pressed
+    # ── Global hotkeys ────────────────────────────────────────────────────────
+    hotkeys = {
+        "<alt>+s": _on_hotkey,
+        "<cmd>+<shift>+s": _on_hotkey,
     }
-    
-    print(f"🎹 Registering background global hotkeys: {CYAN}Option+S{RESET} and {CYAN}Cmd+Shift+S{RESET}")
-    
+    print(f"🎹 Hotkeys: {_C}Option+S{_RS} / {_C}Cmd+Shift+S{_RS}")
     try:
-        listener = keyboard.GlobalHotKeys(hotkeys_dict)
+        listener = keyboard.GlobalHotKeys(hotkeys)
         listener.start()
-    except Exception as e:
-        print(f"{RED}❌ Failed to register global keyboard listener: {e}{RESET}", file=sys.stderr)
+    except Exception as exc:
+        print(f"{_R}❌ Hotkey error: {exc}{_RS}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"💡 {GREEN}Fallback:{RESET} You can also press {CYAN}Enter{RESET} in this terminal window to toggle recording.")
-    print(f"\n[Ready] Sitting in background (Press {CYAN}Option+S{RESET}, {CYAN}Cmd+Shift+S{RESET}, or {CYAN}Enter{RESET} in terminal to toggle)...")
-    
-    # 6. Keep main thread alive and listen for Enter key fallback
+    print(f"💡 You can also press {_C}Enter{_RS} in this terminal to toggle.")
+    print(
+        f"\n{_G}[Ready]{_RS} Click into a text field, "
+        f"then press your hotkey to start dictating.\n"
+    )
+
+    # ── Main loop (Enter fallback) ────────────────────────────────────────────
     try:
         while True:
             input()
-            on_hotkey_pressed()
+            _on_hotkey()
     except (KeyboardInterrupt, EOFError):
-        print(f"\n{BLUE}Shutting down dictation utility...{RESET}")
-        
-        # Stop background workers
-        raw_audio_queue.put(None)
-        transcription_queue.put(None)
-        
-        processing_thread.join(timeout=2.0)
-        transcription_thread.join(timeout=2.0)
-        
-        # Stop keyboard listener
+        print(f"\n{_B}Shutting down…{_RS}")
+        _raw_q.put(_STOP)
+        _xscr_q.put(None)
         listener.stop()
         print("Goodbye!")
 
