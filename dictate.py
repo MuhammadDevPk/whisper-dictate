@@ -44,7 +44,7 @@ BLOCKSIZE: int = 1024           # Samples per chunk (64 ms at 16 kHz)
 #   "base.en"   → Fast,     decent accuracy   (~74 MB)
 #   "small.en"  → Balanced, good accuracy     (~461 MB)  ← RECOMMENDED
 #   "medium.en" → Slower,   high accuracy     (~1.5 GB)
-MODEL_SIZE: str = "small.en"
+MODEL_SIZE: str = "small"       # Multilingual model (needed for Urdu + English)
 DEVICE: str = "cpu"
 COMPUTE_TYPE: str = "int8"      # int8 is 2-3× faster than float32 on Intel x86_64
 CPU_THREADS: int = 6
@@ -53,19 +53,15 @@ CPU_THREADS: int = 6
 BEAM_SIZE_STREAMING: int = 1    # Greedy decoding for streaming previews (fastest)
 BEAM_SIZE_FINAL: int = 5        # Beam search for final commits (most accurate)
 
-# Prime Whisper with correct spellings of names / terms you use often.
-# This dramatically improves recognition of proper nouns.
-INITIAL_PROMPT: str = (
-    "Hello, my name is Muhammad. I am from Sargodha. "
-    "I am dictating clear, well-punctuated English text."
-)
+# Prime Whisper with correct spellings/style for each language.
+INITIAL_PROMPT_EN: str | None = None
+INITIAL_PROMPT_UR: str | None = None
 
 # ── Voice Activity Detection ─────────────────────────────────────────────────
-VAD_SENSITIVITY: float = 1.8    # Noise-floor multiplier (lower = more sensitive; 1.3–2.5)
-AUTO_COMMIT_DELAY: float = 0.5  # Seconds of silence before finalizing a segment
+VAD_SENSITIVITY: float = 2.8    # Noise-floor multiplier (lower = more sensitive; 1.8–3.5)
+AUTO_COMMIT_DELAY: float = 1.0  # Seconds of silence before committing a segment
 STREAMING_INTERVAL: float = 0.4 # Seconds between streaming transcription updates
 PRE_SPEECH_CHUNKS: int = 5      # Chunks retained before speech onset (~320 ms cushion)
-NEWLINE_PAUSE: float = 3.0      # Seconds of pause before inserting a newline
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -102,8 +98,9 @@ _raw_q: queue.Queue = queue.Queue()
 _xscr_q: queue.Queue = queue.Queue()
 _stream: sd.InputStream | None = None
 
-_vad_threshold: float = 0.003
+_vad_threshold: float = 0.012
 _latest_text: str = ""
+_active_lang: str = "ur"  # Currently selected language: "en" or "ur"
 
 _kb = keyboard.Controller()
 
@@ -122,7 +119,7 @@ def _audio_cb(indata: np.ndarray, frames: int, time_info, status) -> None:
     _raw_q.put(indata.copy())
 
 
-def _enqueue_streaming(audio: np.ndarray, prepend_nl: bool) -> None:
+def _enqueue_streaming(audio: np.ndarray, lang: str) -> None:
     """
     Queue a streaming (provisional) transcription request.
     Drops stale streaming items to prevent backlog while preserving
@@ -138,7 +135,7 @@ def _enqueue_streaming(audio: np.ndarray, prepend_nl: bool) -> None:
             break
     for item in kept:
         _xscr_q.put(item)
-    _xscr_q.put((audio, False, prepend_nl))
+    _xscr_q.put((audio, False, lang))
 
 
 def _vad_worker() -> None:
@@ -153,11 +150,11 @@ def _vad_worker() -> None:
 
     speech_buf: list[np.ndarray] = []
     pre_speech: deque[np.ndarray] = deque(maxlen=PRE_SPEECH_CHUNKS)
+    rms_history: list[float] = []
     is_speaking = False
+    consecutive_above = 0
     silence_s = 0.0
     last_stream_t = 0.0
-    last_commit_t = 0.0
-    prepend_nl = False
 
     # Throttle terminal redraws to ≤ 10 Hz
     last_print_t = 0.0
@@ -177,68 +174,79 @@ def _vad_worker() -> None:
                 if speech_buf:
                     audio = np.concatenate(speech_buf).flatten()
                     if np.sqrt(np.mean(audio ** 2)) >= 1e-4:
-                        _xscr_q.put((audio, True, prepend_nl))
+                        _xscr_q.put((audio, True, _active_lang))
                     speech_buf.clear()
                 is_speaking = False
+                consecutive_above = 0
                 silence_s = 0.0
                 pre_speech.clear()
+                rms_history.clear()
                 _raw_q.task_done()
                 continue
 
             # ── Normal audio chunk ──
             rms = np.sqrt(np.mean(chunk ** 2))
 
-            if rms > _vad_threshold:
-                # Speech detected
-                if not is_speaking:
+            rms_history.append(rms)
+            if len(rms_history) > 150:
+                rms_history.pop(0)
+
+            if len(rms_history) >= 30:
+                noise_floor = float(np.percentile(rms_history, 15))
+                threshold = max(noise_floor * VAD_SENSITIVITY, 0.020)
+            else:
+                threshold = _vad_threshold
+
+            if rms > threshold:
+                consecutive_above += 1
+            else:
+                consecutive_above = 0
+
+            if not is_speaking:
+                if consecutive_above >= 3:  # Speech confirmed (3 consecutive chunks ~192 ms)
                     is_speaking = True
                     speech_buf = list(pre_speech)   # prepend onset cushion
                     pre_speech.clear()
-                    last_stream_t = time.monotonic()
-                    prepend_nl = (
-                        last_commit_t > 0
-                        and time.monotonic() - last_commit_t >= NEWLINE_PAUSE
-                    )
-
-                speech_buf.append(chunk)
-                silence_s = 0.0
-
-                # Periodic streaming transcription
-                now = time.monotonic()
-                if now - last_stream_t >= STREAMING_INTERVAL:
-                    _enqueue_streaming(
-                        np.concatenate(speech_buf).flatten(), prepend_nl,
-                    )
-                    last_stream_t = now
-            else:
-                # Silence
-                if is_speaking:
                     speech_buf.append(chunk)
+                    silence_s = 0.0
+                    last_stream_t = time.monotonic()
+                else:
+                    pre_speech.append(chunk)     # deque auto-evicts oldest
+            else:
+                speech_buf.append(chunk)
+                if consecutive_above >= 2:  # Speech continuation confirmed (2 consecutive chunks ~128 ms)
+                    silence_s = 0.0
+                else:
                     silence_s += _CHUNK_SEC
                     if silence_s >= AUTO_COMMIT_DELAY:
                         _xscr_q.put((
                             np.concatenate(speech_buf).flatten(),
                             True,
-                            prepend_nl,
+                            _active_lang,
                         ))
-                        last_commit_t = time.monotonic()
                         speech_buf.clear()
                         is_speaking = False
                         silence_s = 0.0
                         pre_speech.clear()
-                else:
-                    pre_speech.append(chunk)     # deque auto-evicts oldest
+                        consecutive_above = 0
+
+                # Periodic streaming transcription while speaking
+                now = time.monotonic()
+                if now - last_stream_t >= STREAMING_INTERVAL:
+                    _enqueue_streaming(np.concatenate(speech_buf).flatten(), _active_lang)
+                    last_stream_t = now
 
             # ── Status bar (throttled) ──
             now = time.monotonic()
             if (now - last_print_t >= 0.1) or (is_speaking != prev_speaking):
                 buf_s = len(speech_buf) * _CHUNK_SEC
                 icon = f"{_G}🟢{_RS}" if is_speaking else f"{_Y}⚪{_RS}"
+                lang_label = "EN" if _active_lang == "en" else "UR"
                 txt = _latest_text
                 if len(txt) > 20:
                     txt = "…" + txt[-19:]
                 print(
-                    f"\rVAD: {icon} | RMS: {rms:.4f}/{_vad_threshold:.4f}"
+                    f"\rVAD: {icon} ({lang_label}) | RMS: {rms:.4f}/{threshold:.4f}"
                     f" | Buf: {buf_s:.1f}s | \"{_C}{txt}{_RS}\"    ",
                     end="", flush=True,
                 )
@@ -306,23 +314,29 @@ def _xscr_worker(model: WhisperModel) -> None:
             _xscr_q.task_done()
             break
 
-        audio_data, is_final, do_newline = item
+        audio_data, is_final, lang = item
 
         try:
             beam = BEAM_SIZE_FINAL if is_final else BEAM_SIZE_STREAMING
+            prompt = INITIAL_PROMPT_EN if lang == "en" else INITIAL_PROMPT_UR
             segments, _ = model.transcribe(
                 audio_data,
                 beam_size=beam,
-                language="en",
-                initial_prompt=INITIAL_PROMPT,
+                language=lang,
+                initial_prompt=prompt,
                 without_timestamps=True,
+                condition_on_previous_text=False,
+                vad_filter=True,  # Crucial: filters out silence/noise to prevent hallucinations
+                vad_parameters=dict(threshold=0.65),  # Stricter neural VAD threshold to reject noise
+                compression_ratio_threshold=2.0,       # Reject repetitive text loop hallucinations
             )
             full = "".join(seg.text for seg in segments).strip()
+            # Clean text: remove newlines/carriage returns to prevent auto-submission in chat apps
+            full = full.replace("\n", " ").replace("\r", " ")
+            while "  " in full:
+                full = full.replace("  ", " ")
 
             if full:
-                if do_newline and not typed:
-                    _kb.type("\n")
-
                 _diff_type(typed, full)
 
                 if is_final:
@@ -361,12 +375,13 @@ def _xscr_worker(model: WhisperModel) -> None:
 #  RECORDING CONTROL
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _toggle() -> None:
+def _toggle(lang: str = "en") -> None:
     """Thread-safe state machine: IDLE → RECORDING → TRANSCRIBING."""
-    global _state, _stream
+    global _state, _stream, _active_lang
 
     with _state_lock:
         if _state == _S_IDLE:
+            _active_lang = lang
             # Drain stale audio
             while not _raw_q.empty():
                 try:
@@ -384,8 +399,9 @@ def _toggle() -> None:
                 )
                 _stream.start()
                 _state = _S_REC
+                lang_name = "English" if lang == "en" else "Urdu"
                 print(
-                    f"\n🟢 {_G}{_BD}Listening…{_RS}"
+                    f"\n🟢 {_G}{_BD}Listening ({lang_name})…{_RS}"
                     f" (Press hotkey or Enter to stop)"
                 )
             except Exception as exc:
@@ -415,9 +431,14 @@ def _toggle() -> None:
             )
 
 
-def _on_hotkey() -> None:
-    """Hotkey callback — dispatches toggle to a daemon thread."""
-    threading.Thread(target=_toggle, daemon=True).start()
+def _on_hotkey_en() -> None:
+    """Hotkey callback for English dictation."""
+    threading.Thread(target=_toggle, args=("en",), daemon=True).start()
+
+
+def _on_hotkey_ur() -> None:
+    """Hotkey callback for Urdu dictation."""
+    threading.Thread(target=_toggle, args=("ur",), daemon=True).start()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -425,7 +446,7 @@ def _on_hotkey() -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    global _vad_threshold
+    global _vad_threshold, _active_lang
 
     print(f"\n{_B}{_BD}═══ Whisper Dictation ═══{_RS}")
     print(
@@ -452,10 +473,10 @@ def main() -> None:
         )
         sd.wait()
         noise_rms = float(np.sqrt(np.mean(calib ** 2)))
-        _vad_threshold = max(noise_rms * VAD_SENSITIVITY, 0.0025)
+        _vad_threshold = max(noise_rms * VAD_SENSITIVITY, 0.020)  # Higher minimum to ignore AGC hiss
         print(f"✅ Noise: {noise_rms:.5f} → Threshold: {_vad_threshold:.5f}")
     except Exception as exc:
-        _vad_threshold = 0.003
+        _vad_threshold = 0.025  # Safe fallback for noisy environments
         print(f"{_Y}⚠️  Calibration failed: {exc} (using {_vad_threshold}){_RS}")
 
     # ── Load model ────────────────────────────────────────────────────────────
@@ -500,10 +521,14 @@ def main() -> None:
 
     # ── Global hotkeys ────────────────────────────────────────────────────────
     hotkeys = {
-        "<alt>+s": _on_hotkey,
-        "<cmd>+<shift>+s": _on_hotkey,
+        "<alt>+s": _on_hotkey_en,
+        "<cmd>+<shift>+s": _on_hotkey_en,
+        "<alt>+u": _on_hotkey_ur,
+        "<cmd>+<shift>+u": _on_hotkey_ur,
     }
-    print(f"🎹 Hotkeys: {_C}Option+S{_RS} / {_C}Cmd+Shift+S{_RS}")
+    print(
+        f"🎹 Hotkeys: {_C}Option+S{_RS} (English) | {_C}Option+U{_RS} (Urdu)"
+    )
     try:
         listener = keyboard.GlobalHotKeys(hotkeys)
         listener.start()
@@ -520,8 +545,18 @@ def main() -> None:
     # ── Main loop (Enter fallback) ────────────────────────────────────────────
     try:
         while True:
-            input()
-            _on_hotkey()
+            cmd = input().strip().lower()
+            if cmd == "ur":
+                _active_lang = "ur"
+                print(f"🌐 Language switched to: {_C}Urdu (ur){_RS}")
+                continue
+            elif cmd == "en":
+                _active_lang = "en"
+                print(f"🌐 Language switched to: {_C}English (en){_RS}")
+                continue
+            
+            # Toggle dictation using current active language
+            threading.Thread(target=_toggle, args=(_active_lang,), daemon=True).start()
     except (KeyboardInterrupt, EOFError):
         print(f"\n{_B}Shutting down…{_RS}")
         _raw_q.put(_STOP)
