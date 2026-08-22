@@ -44,7 +44,7 @@ BLOCKSIZE: int = 1024           # Samples per chunk (64 ms at 16 kHz)
 #   "base.en"   → Fast,     decent accuracy   (~74 MB)
 #   "small.en"  → Balanced, good accuracy     (~461 MB)  ← RECOMMENDED
 #   "medium.en" → Slower,   high accuracy     (~1.5 GB)
-MODEL_SIZE: str = "small"       # Multilingual model (needed for Urdu + English)
+MODEL_SIZE: str = "small.en"       # Multilingual model (needed for Urdu + English)
 DEVICE: str = "cpu"
 COMPUTE_TYPE: str = "int8"      # int8 is 2-3× faster than float32 on Intel x86_64
 CPU_THREADS: int = 6
@@ -58,7 +58,7 @@ INITIAL_PROMPT_EN: str | None = None
 INITIAL_PROMPT_UR: str | None = None
 
 # ── Voice Activity Detection ─────────────────────────────────────────────────
-VAD_SENSITIVITY: float = 2.8    # Noise-floor multiplier (lower = more sensitive; 1.8–3.5)
+VAD_SENSITIVITY: float = 2.2    # Noise-floor multiplier (lower = more sensitive; 1.8–3.5)
 AUTO_COMMIT_DELAY: float = 1.0  # Seconds of silence before committing a segment
 STREAMING_INTERVAL: float = 0.4 # Seconds between streaming transcription updates
 PRE_SPEECH_CHUNKS: int = 5      # Chunks retained before speech onset (~320 ms cushion)
@@ -100,7 +100,7 @@ _stream: sd.InputStream | None = None
 
 _vad_threshold: float = 0.012
 _latest_text: str = ""
-_active_lang: str = "ur"  # Currently selected language: "en" or "ur"
+_active_lang: str = "en"  # Currently selected language: "en" or "ur"
 
 _kb = keyboard.Controller()
 
@@ -150,7 +150,7 @@ def _vad_worker() -> None:
 
     speech_buf: list[np.ndarray] = []
     pre_speech: deque[np.ndarray] = deque(maxlen=PRE_SPEECH_CHUNKS)
-    rms_history: list[float] = []
+    noise_floor = _vad_threshold / VAD_SENSITIVITY
     is_speaking = False
     consecutive_above = 0
     silence_s = 0.0
@@ -180,23 +180,26 @@ def _vad_worker() -> None:
                 consecutive_above = 0
                 silence_s = 0.0
                 pre_speech.clear()
-                rms_history.clear()
+                noise_floor = _vad_threshold / VAD_SENSITIVITY
                 _raw_q.task_done()
                 continue
 
             # ── Normal audio chunk ──
             rms = np.sqrt(np.mean(chunk ** 2))
 
-            rms_history.append(rms)
-            if len(rms_history) > 150:
-                rms_history.pop(0)
+            # Calculate current threshold using previous noise floor estimate
+            threshold = max(noise_floor * VAD_SENSITIVITY, 0.015)
 
-            if len(rms_history) >= 30:
-                noise_floor = float(np.percentile(rms_history, 15))
-                threshold = max(noise_floor * VAD_SENSITIVITY, 0.020)
-            else:
-                threshold = _vad_threshold
+            # Update noise floor estimate only during silence to avoid speech biasing
+            if rms <= threshold:
+                if rms < noise_floor:
+                    # Track downward trends quickly (e.g. recovering from startup noise spike)
+                    noise_floor = 0.90 * noise_floor + 0.10 * rms
+                else:
+                    # Track upward trends (like AGC gain boosting) slowly
+                    noise_floor = 0.99 * noise_floor + 0.01 * rms
 
+            # Re-evaluate speech logic using the threshold
             if rms > threshold:
                 consecutive_above += 1
             else:
@@ -347,8 +350,9 @@ def _xscr_worker(model: WhisperModel) -> None:
                 else:
                     typed = full
                     _latest_text = full
-            elif is_final:
-                # Empty final — clear any provisional typing
+            else:
+                # Clear any provisional preview currently typed on screen if the
+                # transcription is empty (e.g. silence or noise rejected)
                 _diff_type(typed, "")
                 typed = ""
                 _latest_text = ""
@@ -546,7 +550,9 @@ def main() -> None:
     try:
         while True:
             cmd = input().strip().lower()
-            if cmd == "ur":
+            if cmd in ("exit", "quit", "q"):
+                raise KeyboardInterrupt
+            elif cmd == "ur":
                 _active_lang = "ur"
                 print(f"🌐 Language switched to: {_C}Urdu (ur){_RS}")
                 continue
@@ -554,7 +560,7 @@ def main() -> None:
                 _active_lang = "en"
                 print(f"🌐 Language switched to: {_C}English (en){_RS}")
                 continue
-            
+
             # Toggle dictation using current active language
             threading.Thread(target=_toggle, args=(_active_lang,), daemon=True).start()
     except (KeyboardInterrupt, EOFError):
