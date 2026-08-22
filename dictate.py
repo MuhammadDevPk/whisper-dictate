@@ -58,8 +58,9 @@ INITIAL_PROMPT_EN: str | None = None
 INITIAL_PROMPT_UR: str | None = None
 
 # ── Voice Activity Detection ─────────────────────────────────────────────────
-VAD_SENSITIVITY: float = 2.2    # Noise-floor multiplier (lower = more sensitive; 1.8–3.5)
+VAD_SENSITIVITY: float = 1.5    # Noise-floor multiplier (lower = more sensitive; 1.8–3.5)
 AUTO_COMMIT_DELAY: float = 1.0  # Seconds of silence before committing a segment
+STREAMING_PREVIEW: bool = False # Set to True for real-time preview typing (flickers/rewrites), False for typing only final commits (fastest & cleanest)
 STREAMING_INTERVAL: float = 0.4 # Seconds between streaming transcription updates
 PRE_SPEECH_CHUNKS: int = 5      # Chunks retained before speech onset (~320 ms cushion)
 
@@ -233,11 +234,12 @@ def _vad_worker() -> None:
                         pre_speech.clear()
                         consecutive_above = 0
 
-                # Periodic streaming transcription while speaking
-                now = time.monotonic()
-                if now - last_stream_t >= STREAMING_INTERVAL:
-                    _enqueue_streaming(np.concatenate(speech_buf).flatten(), _active_lang)
-                    last_stream_t = now
+                # Periodic streaming transcription while speaking (if enabled)
+                if STREAMING_PREVIEW:
+                    now = time.monotonic()
+                    if is_speaking and (now - last_stream_t >= STREAMING_INTERVAL) and speech_buf:
+                        _enqueue_streaming(np.concatenate(speech_buf).flatten(), _active_lang)
+                        last_stream_t = now
 
             # ── Status bar (throttled) ──
             now = time.monotonic()
@@ -340,17 +342,21 @@ def _xscr_worker(model: WhisperModel) -> None:
                 full = full.replace("  ", " ")
 
             if full:
-                _diff_type(typed, full)
-
-                if is_final:
-                    _kb.type(" ")
-                    typed = ""
-                    _latest_text = ""
-                    print(f"\n✨ {_G}{_BD}[Committed]{_RS} \"{full}\"")
+                if STREAMING_PREVIEW:
+                    _diff_type(typed, full)
+                    if is_final:
+                        _kb.type(" ")
+                        typed = ""
+                        _latest_text = ""
+                        print(f"\n✨ {_G}{_BD}[Committed]{_RS} \"{full}\"")
+                    else:
+                        typed = full
+                        _latest_text = full
                 else:
-                    typed = full
-                    _latest_text = full
-            else:
+                    if is_final:
+                        _kb.type(full + " ")
+                        print(f"\n✨ {_G}{_BD}[Committed]{_RS} \"{full}\"")
+            elif STREAMING_PREVIEW:
                 # Clear any provisional preview currently typed on screen if the
                 # transcription is empty (e.g. silence or noise rejected)
                 _diff_type(typed, "")
