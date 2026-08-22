@@ -77,31 +77,30 @@ You can open `dictate.py` and customize several key parameters at the top of the
 
 ```python
 # Whisper Model Configuration
-# Upgrade to "small.en" (highly recommended, ~460MB) for significantly higher accuracy
-MODEL_SIZE = "base.en"
+MODEL_SIZE = "small"       # Multilingual model (supports both English and Urdu)
 DEVICE = "cpu"
-COMPUTE_TYPE = "float32"
+COMPUTE_TYPE = "int8"      # 2-3x faster than float32 on CPU
 CPU_THREADS = 6
 
 # Initial prompt to guide Whisper on spelling, context, and proper nouns
-# Priming this improves Whisper's ability to spell names and vocabulary correctly
-INITIAL_PROMPT = "Hello, my name is Muhammad. I am from Sargodha. I am dictating clear English speech."
+INITIAL_PROMPT_EN = None
+INITIAL_PROMPT_UR = None
 
 # VAD Settings
-AUTO_COMMIT_DELAY = 0.8  # Commit audio segment after 0.8 seconds of silence
-STREAMING_INTERVAL = 1.0  # Transcribe provisional text every 1.0s of continuous speech
-VAD_SENSITIVITY_MULTIPLIER = 1.8  # Calibration noise floor multiplier (Default: 1.8, range 1.5 - 2.5)
+VAD_SENSITIVITY = 2.8      # Noise-floor multiplier (lower = more sensitive; range 1.8 - 3.5)
+AUTO_COMMIT_DELAY = 1.0    # Seconds of silence before committing a segment
+STREAMING_INTERVAL = 0.4   # Seconds between streaming transcription updates
 ```
 
 ### Tuning Recommendations:
-* **For Name & Spellings (e.g., "Muhammad", "Sargodha")**: Prime the `INITIAL_PROMPT` config with your name and common vocab terms. This guides Whisper to choose the correct spellings.
-* **For Higher Accuracy**: Set `MODEL_SIZE = "small.en"`. The `small.en` model is slightly larger (~460MB) but is highly accurate on accents and complex vocabulary.
-* **For Softer/Louder Environments**: Tweak `VAD_SENSITIVITY_MULTIPLIER`. Use `1.5` for a very quiet room (makes it easier to capture quiet breathing/whispers); use `2.2` or higher if your laptop fans spin loudly to avoid VAD false-triggers.
+* **For Name & Spellings**: Prime `INITIAL_PROMPT_EN` or `INITIAL_PROMPT_UR` with your name and common vocabulary. For example: `INITIAL_PROMPT_EN = "Hello, my name is Muhammad. I am from Sargodha."`
+* **VAD Sensitivity**: If the room is very quiet, you can lower `VAD_SENSITIVITY` to `2.2` to capture whispers easily. If you are in a loud room or laptop fans are spinning, raise it to `3.2` to avoid false triggers.
+* **Asymmetric Noise Floor Tracking**: The utility implements an asymmetric tracker to dynamically adapt to macOS Automatic Gain Control (AGC) gain-boosting. This tracks background room noise perfectly and prevents VAD from triggering on silence.
 
 ---
 
 ## Troubleshooting
 
 * **Terminal keeps typing nonsense when dictation starts**: You are focused on the terminal prompt. Switch your focus (click) into another text app like VS Code, Notes, or Chrome.
-* **Whisper repeats words/hallucinated text**: Ensure you remain silent when VAD shows `⚪`. If it triggers in a noisy environment, raise the `VAD_SENSITIVITY_MULTIPLIER` in `dictate.py` to `2.2` or `2.5` to make it less sensitive.
-* **VAD never commits**: Make sure you have a working input microphone device. Calibration needs a quiet 0.8 seconds to compute the threshold. If fans are spinning at 100%, consider lowering the microphone gain in macOS System Settings.
+* **Whisper repeats words/hallucinated text (like "Muhammad, Sargodha")**: Ensure that `INITIAL_PROMPT_EN` and `INITIAL_PROMPT_UR` are set to `None` if they are causing hallucinations on silence or noise. Ensure the active language matches what you are speaking. If you speak English while Urdu (`ur`) is selected, Whisper will hallucinate.
+* **Program does not exit**: You can type `exit`, `quit`, or `q` directly in the terminal, or press `Ctrl + C` to exit cleanly.
